@@ -1,0 +1,28 @@
+{
+  "name": "wf-jsinterp",
+  "version": "0.0.0",
+  "description": "A simplistic Javascript interpreter for the Wildflower programming language",
+  "main": "jsinterp.js",
+  "scripts": {
+    "test": "node test/test.js"
+  },
+  "devDependencies": {
+    "simple-test-framework": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pschanely/wf-jsinterp.git"
+  },
+  "author": "Phillip Schanely",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/pschanely/wf-jsinterp/issues"
+  },
+  "homepage": "https://github.com/pschanely/wf-jsinterp",
+  "dependencies": {
+    "axios": "^0.5.4",
+    "fast-sha256": "^0.9.2",
+    "immutable": "^3.7.5",
+    "q": "^1.4.1"
+  }
+}

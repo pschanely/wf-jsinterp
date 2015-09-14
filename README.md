@@ -1,2 +1,2 @@
 # wf-jsinterp
-A simplistic Wildflower interpreter in Javascript.
+A simplistic [Wildflower](https://github.com/pschanely/wildflower) interpreter in Javascript.
