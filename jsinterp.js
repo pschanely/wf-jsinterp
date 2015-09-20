@@ -4,9 +4,9 @@ var sha256 = require('fast-sha256');
 var Immutable = require('immutable');
 
 var interpId = 'fda006f4779e4d1a87f130406418d7df';
-var ERROR = new Error();
+var ERROR = undefined;
 var EMPTY = Immutable.Seq();
-var PLATFORM_IMPL_URL = 'http://millstonecw.com:11739/module/0c983a57ded9274a5b1b9269b82ee00b';
+var PLATFORM_IMPL_URL = 'http://millstonecw.com:11739/module/cc9a4b26e69e60901d521fcdc0274381';
 
 function Cons(l, r) {
     this.l = l;
@@ -26,6 +26,37 @@ Cons.prototype.toArray = function() {
     }
     return ret;
 };
+Cons.prototype.popN = function(n) {
+    var x = this;
+    while (n > 0) {
+	x = x.r;
+	n--;
+    }
+    return x;
+}
+	
+function wfTypeOf(val) {
+    if (val === ERROR) {
+	return 'error'; 
+    } else if (typeof val === 'object') {
+	if (val === null) {
+	    return 'null';
+	}
+	if (Immutable.Map.isMap(val)) {
+	    return 'map';
+	}
+	if (Immutable.Iterable.isIterable(val) || Immutable.List.isList(val) || Immutable.Seq.isSeq(val)) {
+	    return 'list';
+	}
+	if (val.length && val.length == 2) {
+	    return 'function';
+	}
+	console.log('do not know how to type this: ', val);
+	throw new Error('do not know how to type this: ', val);
+    } else {
+	return typeof val; // boolean or number, hopefully!
+    }
+}
 
 function stackToJs(stack) {
     return (stack === null) ? [] : stack.toArray();
@@ -56,9 +87,16 @@ var DISPATCH = {
 	for(var i=0; i<branchlen; i++) {
 	    var branch = branches[i];
 	    var condition = branch.condition;
-	    if (condition === undefined || execBlock(condition, lcls, fnptr, trace, env).l) {
-		return execBlock(branch.code, lcls, fnptr, trace, env);
+	    if (condition !== undefined) {
+		var ok = execBlock(condition, lcls, fnptr, trace, env).l;
+		if (!ok) { 
+		    console.log('condition failed');
+		    //if (ok === ERROR)  // TODO need to emulate the 'cond' inputs and outputs
+		    continue;
+		}
+		console.log('condition passed');
 	    }
+	    return execBlock(branch.code, lcls, fnptr, trace, env);
 	}
 	throw new Error("no branch taken");
     },
@@ -87,21 +125,27 @@ function hashString(string) {
 }
 
 _BASIC_HASHES = {
-    undefined: function(v){return 2;},
+    error: function(v){return 2;},
     null: function(v){return 4;},
     boolean: function(v){return v ? 8 : 16},
     number: function(v){return hashString(v.toString());},
     string: hashString,
-    object: function(v){return v.hashCode();} // immutable.js provides this
+    function: function(pair){ return hashString(pair[1].fnId) + hashString(JSON.stringify(pair[1].vars)) }, //TODO slow
+    map: function(v){return v.hashCode();},
+    list: function(v){return v.hashCode();},
 }
 function hashValue(val) {
-    return _BASIC_HASHES[typeof val](val);
+    var typ = wfTypeOf(val);
+    console.log('hashValue', val, 'withtype', typ);
+    return _BASIC_HASHES[typ](val);
 }
 
 function hashInputs(lcls, fn) {
     var hash = 0;
+    console.log('SAVING DJSKLD', fn);
     for(var consumed = fn.numConsumed; consumed > 0; consumed--) {
-	hash  = ((hash << 5) - hash) + hashVal(lcls.l);
+	var val = hashValue(lcls.l);
+	hash  = ((hash << 5) - hash) + val;
 	hash |= 0;
 	lcls = lcls.r;
     }
@@ -113,14 +157,16 @@ function lookupInTrace(lcls, fnId, fn, calls) {
     if (byfn === undefined) return undefined;
     var hash = hashInputs(lcls, fn);
     var hits = byfn[hash];
+    console.log('lookup in trace', fn, hash, 'hits:', hits, 'stack:', stackToJs(lcls));
     if (hits === undefined) return undefined;
-    var numInputs = fn.numConsumed;
+    var numInputs = (fn._wft_numConsumed === undefined) ? fn.numConsumed : fn._wft_numConsumed;
     for(var i=hits.length-1; i>=0; i--) {
 	var hit = hits[i];
-	var isSame = true;
 	var hitItr = hit[0];
 	var lclItr = lcls;
+	var isSame = true;
 	for(var i=0; i<numInputs; i++) {
+	    console.log('lookup in trace hit check', hitItr.l, lclItr.l);
 	    if (!Immutable.is(hitItr.l, lclItr.l)) {
 		isSame = false;
 		break;
@@ -137,8 +183,7 @@ function lookupInTrace(lcls, fnId, fn, calls) {
 function makeSavingTracer() {
     var calls = {};
     return {
-	start: function(lcls, fnId, fn) {
-	},
+	start: function(lcls, fnId, fn) {},
 	end: function(ret, lcls, fnId, fn) {
 	    var byfn = calls[fnId];
 	    if (byfn === undefined) {
@@ -149,38 +194,79 @@ function makeSavingTracer() {
 	    if (hits === undefined) {
 		hits = byfn[lclHash] = [];
 	    }
+	    console.log('SAVING hash:', lclHash, ' for ', fn.name, 'given', Immutable.List(stackToJs(lcls)).toJS()); 
 	    hits.push([lcls, ret]);
+	},
+	forgetAboutFnId: function(fnId) {
+	    delete calls[fnId];
 	},
 	lookupInTrace: function(lcls, fnId, fn) {
 	    return lookupInTrace(lcls, fnId, fn, calls);
+	},
+    };
+}
+
+function makeCachedTracer(saved, optraceData) { // re-uses a cache to speed up execution if possible
+    return {
+        start: function(lcls, fnId, fn) {
+	    var newStack = saved.lookupInTrace(lcls, fnId, fn);
+	    if (newStack === undefined) {
+		console.log('cache could not find ', fn.name);	
+		return;
+	    }
+	    var consumed = (fn._wft_numConsumed === undefined) ? fn.numConsumed : fn._wft_numConsumed;
+	    var produced = (fn._wft_numProduced === undefined) ? fn.numProduced : fn._wft_numProduced;
+	    if (consumed > 0) {
+		lcls = lcls.popN(consumed); // remove the inputs
+	    }
+	    for(var i=produced; i>0; i--) { // copy the outputs
+		lcls = new Cons(newStack.l, lcls);
+		newStack = newStack.r;
+	    }
+	    return lcls;
+	},
+        end: function(ret, lcls, fnId, fn) {},
+	optrace: function(rec, lcls) {
+	    if (optraceData) {
+		optraceData.push([rec, lcls]);
+	    }
 	}
     };
 }
 
+
 function execFn(lcls, fnptr, trace, env) {
     var fnId = fnptr.fnId;
+    var fn = fnptr.module.functions[fnId];
     var doTrace = trace !== undefined;
     if (doTrace) {
-	var ret = trace.start(lcls, fnId, env);
-	if (ret) return ret;
+	var ret = trace.start(lcls, fnId, fn);
+	if (ret !== undefined) return ret;
     }
-    var fn = fnptr.module.functions[fnId];
+    console.log(fn.name, 'enter');
+    var ret = rawExecFn(lcls, fnptr, trace, env, fn);
+    console.log(fn.name, 'exit');
+    if (doTrace) {
+	trace.end(ret, lcls, fnId, fn);
+    }
+    return ret;
+}
+
+function rawExecFn(lcls, fnptr, trace, env, fn) {
     var ret;
     if (execBlock(fn.condition, lcls, fnptr, trace, env).l) {
+	console.log(fn.name, 'passed guard @ ', fnptr.module.name);
 	ret = execBlock(fn.code, lcls, fnptr, trace, env);
     } else {
 	var superId = fn.overrides;
 	if (superId) {
-	    throw Error('does not work yet!');
+	    throw new Error('does not work yet!');
 	    var thisScope = {module:fnptr.module, fnId:fnptr.fnId, vars:{}};
 	    var target = resolveFn(fn.overrides, fnptr.module, env.resolver);
 	    ret = execFn(target, lcls, fnptr, trace, env);
 	} else {
 	    throw new Error('No implementation found for "' + fn.name + '"');
 	}
-    }
-    if (doTrace) {
-	trace.end(lcls, fnId, ret, env);
     }
     return ret;
 }
@@ -202,7 +288,11 @@ function resolveFn(op, module, resolver) {
 }
 
 function execBlock(ops, lcls, fnptr, trace, env) {
+    var doOpTrace = trace.optrace;
     ops.forEach(function(rec) {
+	if (doOpTrace) {
+	    doOpTrace(rec, lcls);
+	}
 	console.log('< ', stackToJs(lcls));
 	console.log('> ', rec);
 	var exec = rec._exec;
@@ -229,11 +319,13 @@ function execBlock(ops, lcls, fnptr, trace, env) {
 	    }
 	    rec._exec = exec;
 	}
-	try { 
-	    lcls = exec(rec, lcls, fnptr, trace, env);
+	//try {
+	lcls = exec(rec, lcls, fnptr, trace, env);
+	/*
 	} catch(err) { // hopefully this will only happen for native code
 	    console.log(err+'');
 	    var fn = fnptr.module.functions[fnptr.fnId];
+	    console.log('emulating fn ', fn);
 	    for(var i=fn.numConsumed; i>0; i--) {
 		lcls = lcls.r;
 	    }
@@ -241,6 +333,7 @@ function execBlock(ops, lcls, fnptr, trace, env) {
 		lcls = new Cons(ERROR, lcls);
 	    }
 	}
+	*/
     });
     return lcls;
 }
@@ -292,15 +385,76 @@ function load(moduleUrl, env) {
 }
 */
 
+function wfVisitCodeEnv(moduleMap, cb) {
+    Object.keys(moduleMap).forEach(function(moduleId) {
+	wfVisitModule(moduleMap[moduleId], moduleId, cb, [moduleId]);
+    });
+}
+function wfVisitModule(module, cb, path) {
+    path = path || [];
+    cb.module && cb.module(module, path);
+    var functions = module.functions;
+    Object.keys(functions).forEach(function(fnId) {
+	path.push(fnId)
+	var fn = functions[fnId];
+	wfVisitFunction(fn, cb, path, module);
+	path.pop();
+    });
+    cb.bottomUpModule && cb.bottomUpModule(module, path);
+}
+function wfVisitFunction(fn, cb, path, module) {
+    path = path || [];
+    cb.fn && cb.fn(fn, path, module);
+    wfVisitBlock(fn, cb, path, fn, module);
+    cb.bottomUpFn && cb.bottomUpFn(fn, path, module);
+}
+function wfVisitBlock(block, cb, path, fn, module) {
+    cb.block && cb.block(block, path, fn, module);
+    ['condition','code'].forEach(function(key) {
+	if (block[key]) {
+	    path.push('key');
+	    wfVisitCodeitems(block[key], cb, path, fn, module);
+	    path.pop();
+	}
+    });
+    cb.bottomUpBlock && cb.bottomUpBlock(block, path, fn, module);
+}
+function wfVisitCodeitems(codeitems, cb, path, fn, module) {
+    codeitems.forEach(function(codeop, idx) {
+	path.push(idx);
+	wfVisitCodeOp(codeop, cb, path, fn, module);
+	path.pop();
+    });
+}
+function wfVisitCodeOp(codeOp, cb, path, fn, module) {
+    cb.op && cb.op(codeOp, path, fn, module);
+    var op = codeOp.op;
+    if (op === 'lambda') {
+	wfVisitBlock(codeOp, cb, path, fn, module);
+    } else if (op === 'cond') {
+	path.push('branches');
+	codeOp.branches.forEach(function(block, idx) { 
+	    path.push(idx);
+	    wfVisitBlock(block, cb, path, fn, module);
+	    path.pop();
+	});
+	path.pop();
+    }
+    cb.bottomUpOp && cb.bottomUpOp(codeOp, path, fn, module);
+}
+
+
 function orderModuleDeps(moduleId, resolver, seen) {
+    if (seen[moduleId]) return [];
+    seen[moduleId] = true;
     var result = [];
     var module = resolver.resolve(moduleId);
-    console.log('m', moduleId, module);
+    if (! module) {
+	console.log('Module not found: ', moduleId);
+    }
     module.refs.forEach(function(ref) {
-	var moduleId = resolver.moduleId(ref);
-	if (seen[moduleId]) return;
-	seen[moduleId] = true;
-	result = result.concat(orderModuleDeps(resolver.moduleId(ref), resolver, seen));
+	var refModuleId = resolver.moduleId(ref);
+	result = result.concat(orderModuleDeps(refModuleId, resolver, seen));
     });
     result.push(moduleId);
     return result;
@@ -326,7 +480,7 @@ _REWIRE_MAP = {
     load: noop,
     dynamicScope: noop,
 };
-    
+
 function rewireCode(code, fnRemap, moduleId, resolver) {
     code.forEach(function(op) {
 	var opcode = op.op;
@@ -335,10 +489,9 @@ function rewireCode(code, fnRemap, moduleId, resolver) {
 	    return action(op, fnRemap, moduleId, resolver);
 	} else {
 	    var absId = absFnId(opcode, moduleId, resolver);
-	    console.log('remap', absId);
 	    var target = fnRemap[absId];
 	    if (target.join(':') !== absId) {
-		console.log('rewired ', absId, target);
+		console.log('rewire from ', absId, ' to ', target);
 	    }
 	    op._resolved = target;
 	}
@@ -364,39 +517,87 @@ function absFnId(relativeId, moduleId, resolver) {
 
 function resolveOverrides(moduleId, resolver, pluginModuleIds) {
     var moduleIds = pluginModuleIds.concat([moduleId]);
-    moduleIds = orderModules(moduleIds, resolver, {});
-    console.log('order: ', moduleIds);
+    console.log('Begin resolving overrides.  Modules given: ', moduleIds);
+    moduleIds = orderModules(moduleIds, resolver);
+    console.log('Resolving overrides.  Module order: ', moduleIds);
+    // pass one : populate fnRemap
     var fnRemap = {};
     moduleIds.forEach(function(moduleId) {
 	var module = resolver.resolve(moduleId);
-	console.log('consider module', moduleId, module.name);
+	console.log('scanning module ', moduleId, module.name);
 	Object.keys(module.functions).forEach(function(fnId) {
 	    var fn = module.functions[fnId];
-	    console.log('consider fn', fn.name);
 	    if (fn.nativeCode && ! fn.code) return;
+	    console.log('scanning fn ', fn.name);
 	    var myAbsId = moduleId + ':' + fnId;
 	    if (fn.overrides) {
 		var overridden = absFnId(fn.overrides, moduleId, resolver);
 		fnRemap[overridden] = [moduleId, fnId];
+		console.log('override', overridden, ' to ', moduleId+':'+fnId);
 	    }
 	    fnRemap[myAbsId] = [moduleId, fnId];
+	});
+    });
+    // pass two : rewire all the function pointers
+    moduleIds.forEach(function(moduleId) {
+	var module = resolver.resolve(moduleId);
+	Object.keys(module.functions).forEach(function(fnId) {
+	    var fn = module.functions[fnId];
 	    rewireBlock(fn, fnRemap, moduleId, resolver);
-	    console.log('assign', myAbsId, fnRemap[myAbsId].join(':'));
 	});
     });
 }
 
+_FINDERS = {
+    'map': function(value, container, path) {
+	throw new Error();
+    },
+    'list': function(value, container, path) {
+	var hit = undefined;
+	container.forEach(function(item, idx) {
+	    path.push(idx);
+	    hit = findValueIn(value, item, path);
+	    if (hit) return false;
+	    path.pop();
+	    return true;
+	});
+	return hit;
+    }
+}
+
+function findValueIn(value, container, path) {
+    path = path || [];
+    if (value === container) return path;
+    var finder = _FINDERS[wfTypeOf(container)];
+    if (finder === undefined) return undefined;
+    return finder(value, container, path);
+}
+
 module.exports = {
+    emptyStack: function() { return null; },
     cons: function(x,y){ return new Cons(x,y); },
+    stackToWfList: function(stack){ return Immutable.List(stackToJs(stack));},
 //    load: load,
+    interpreterId: interpId,
     platformImplUrl: PLATFORM_IMPL_URL,
     makeSavingTracer: makeSavingTracer,
-    execute: function(moduleId, fnId, resolver, lcls, tracer, plugins) {
-	resolveOverrides(moduleId, resolver, plugins);
-	var env = {resolver:resolver};
-	var module = resolver.resolve(moduleId);
-	var ret = stackToJs(execFn(lcls, {module:module, fnId:fnId, vars:{}}, tracer, env));
-	console.log('execute result: ', ret[1].toJS());
-	return ret;
+    makeCachedTracer: makeCachedTracer,
+    typeOf: wfTypeOf,
+    visitModule: wfVisitModule,
+    visitFunction: wfVisitFunction,
+    visitBlock: wfVisitBlock,
+    visitCodeOp: wfVisitCodeOp,
+    findValueIn: findValueIn,
+
+    isFunctionCall: function(op){ return DISPATCH[op.op] === undefined; },
+    prepare: function(rootModuleId, resolver, plugins) {
+	resolveOverrides(rootModuleId, resolver, plugins);
+	return function executor(moduleId, fnId, lcls, tracer) {
+	    var env = {resolver:resolver};
+	    var module = resolver.resolve(moduleId);
+	    var ret = stackToJs(rawExecFn(lcls, {module:module, fnId:fnId, vars:{}}, tracer, env, module.functions[fnId]));
+	    console.log('execute result: ', ret);
+	    return ret;
+	};
     }
 };
