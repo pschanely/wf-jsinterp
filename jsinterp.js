@@ -34,6 +34,37 @@ Cons.prototype.popN = function(n) {
     }
     return x;
 }
+
+function Lambda(codearray, scope) {
+    this.codearray = codearray;
+    this.scope = scope;
+}
+Lambda.prototype.equals = function(other) {
+    if (this.codearray !== other.codearray) return false;
+    if (JSON.stringify(this.scope.vars) !== JSON.stringify(other.scope.vars)) return false;
+    return true;
+};
+Lambda.prototype.hashCode = function() {
+    var hsh = hashString(this.scope.fnId) + hashString(this.scope.moduleId);
+    hsh += hashString(JSON.stringify(this.scope.vars));
+    return hsh;
+};
+
+function Scope(moduleId, fnId, resolver) {
+    this.moduleId = moduleId;
+    this.fnId = fnId;
+    this.resolver = resolver;
+    this.vars = {};
+}
+Scope.prototype.fork = function() {
+    return new Scope(this.moduleId, this.fnId, this.resolver);
+};
+Scope.prototype.valueOf = function() {
+    return this.moduleId + ':' + this.fnId + ':' + JSON.stringify(this.vars);
+};
+Scope.prototype.getModule = function() {
+    return this.resolver.resolve(this.moduleId);
+};
 	
 function wfTypeOf(val) {
     if (val === ERROR) {
@@ -48,7 +79,7 @@ function wfTypeOf(val) {
 	if (Immutable.Iterable.isIterable(val) || Immutable.List.isList(val) || Immutable.Seq.isSeq(val)) {
 	    return 'list';
 	}
-	if (val.length && val.length == 2) {
+	if (val instanceof Lambda) {
 	    return 'function';
 	}
 	console.log('do not know how to type this: ', val);
@@ -75,11 +106,7 @@ var DISPATCH = {
 	return new Cons(jsToWfValue(rec['val']), lcls); 
     },
     'lambda': function(rec, lcls, fnptr, trace, env) {
-	return new Cons([rec.code, fnptr], lcls);
-    },
-    'callLambda': function(rec, lcls, fnptr, trace, env) {
-	var pair = lcls.l;
-	return execBlock(pair[0], lcls.r, fnptr, trace, env);
+	return new Cons(new Lambda(rec.code, fnptr), lcls);
     },
     'cond': function(rec, lcls, fnptr, trace, env) { 
 	var branches = rec['branches'];
@@ -101,8 +128,8 @@ var DISPATCH = {
 	throw new Error("no branch taken");
     },
     'callLambda': function(rec, lcls, fnptr, trace, env) {
-	var closure = lcls.l;
-	return execBlock(closure[0], lcls.r, closure[1], trace, env);
+	var lambda = lcls.l;
+	return execBlock(lambda.codearray, lcls.r, lambda.scope, trace, env);
     },
     'save': function(rec, lcls, fnptr, trace, env) {
 	fnptr.vars[rec.name] = lcls.l;
@@ -130,7 +157,7 @@ _BASIC_HASHES = {
     boolean: function(v){return v ? 8 : 16},
     number: function(v){return hashString(v.toString());},
     string: hashString,
-    function: function(pair){ return hashString(pair[1].fnId) + hashString(JSON.stringify(pair[1].vars)) }, //TODO slow
+    function: function(l){ return l.hashCode();},
     map: function(v){return v.hashCode();},
     list: function(v){return v.hashCode();},
 }
@@ -142,7 +169,6 @@ function hashValue(val) {
 
 function hashInputs(lcls, fn) {
     var hash = 0;
-    console.log('SAVING DJSKLD', fn);
     for(var consumed = fn.numConsumed; consumed > 0; consumed--) {
 	var val = hashValue(lcls.l);
 	hash  = ((hash << 5) - hash) + val;
@@ -166,7 +192,6 @@ function lookupInTrace(lcls, fnId, fn, calls) {
 	var lclItr = lcls;
 	var isSame = true;
 	for(var i=0; i<numInputs; i++) {
-	    console.log('lookup in trace hit check', hitItr.l, lclItr.l);
 	    if (!Immutable.is(hitItr.l, lclItr.l)) {
 		isSame = false;
 		break;
@@ -237,7 +262,7 @@ function makeCachedTracer(saved, optraceData) { // re-uses a cache to speed up e
 
 function execFn(lcls, fnptr, trace, env) {
     var fnId = fnptr.fnId;
-    var fn = fnptr.module.functions[fnId];
+    var fn = fnptr.getModule().functions[fnId];
     var doTrace = trace !== undefined;
     if (doTrace) {
 	var ret = trace.start(lcls, fnId, fn);
@@ -255,15 +280,15 @@ function execFn(lcls, fnptr, trace, env) {
 function rawExecFn(lcls, fnptr, trace, env, fn) {
     var ret;
     if (execBlock(fn.condition, lcls, fnptr, trace, env).l) {
-	console.log(fn.name, 'passed guard @ ', fnptr.module.name);
+	console.log(fn.name, 'passed guard @ ', fnptr.getModule().name);
 	ret = execBlock(fn.code, lcls, fnptr, trace, env);
     } else {
 	var superId = fn.overrides;
 	if (superId) {
 	    throw new Error('does not work yet!');
-	    var thisScope = {module:fnptr.module, fnId:fnptr.fnId, vars:{}};
-	    var target = resolveFn(fn.overrides, fnptr.module, env.resolver);
-	    ret = execFn(target, lcls, fnptr, trace, env);
+	    //var thisScope = {module:fnptr.module, fnId:fnptr.fnId, vars:{}};
+	    //var target = resolveFn(fn.overrides, fnptr.module, env.resolver);
+	    //ret = execFn(lcls, target, trace, env);
 	} else {
 	    throw new Error('No implementation found for "' + fn.name + '"');
 	}
@@ -273,7 +298,7 @@ function rawExecFn(lcls, fnptr, trace, env, fn) {
 
 function resolveFn(op, module, resolver) {
     var resolution = op._resolved;
-    var module = resolver.resolve(resolution[0]);
+    //var module = resolver.resolve(resolution[0]);
     var fnId = resolution[1];
     /*
     var idx = op.indexOf(':');
@@ -284,7 +309,8 @@ function resolveFn(op, module, resolver) {
     var module = resolver.resolve(ref);
     var fnId = op.substring(idx + 1);
     */
-    return {module:module, fnId:fnId, vars:{}};
+    //return {module:module, fnId:fnId, vars:{}};
+    return new Scope(resolution[0], resolution[1], resolver);
 }
 
 function execBlock(ops, lcls, fnptr, trace, env) {
@@ -300,8 +326,9 @@ function execBlock(ops, lcls, fnptr, trace, env) {
 	    var op = rec.op;
 	    exec = DISPATCH[op];
 	    if (! exec) {
-		var newScope = resolveFn(rec, fnptr.module, env.resolver);
-		var target = newScope.module.functions[newScope.fnId];
+		var newScope = resolveFn(rec, fnptr.getModule(), env.resolver);
+		var targetModule = newScope.getModule();
+		var target = targetModule.functions[newScope.fnId];
 		var nativeCode = target.nativeCode;
 		if (nativeCode && nativeCode[interpId]) {
 		    var codeRec = nativeCode[interpId];
@@ -312,8 +339,7 @@ function execBlock(ops, lcls, fnptr, trace, env) {
 		    }
 		} else {
 		    exec = function(c_rec, c_lcls, c_fnptr, c_trace, c_env) {
-			var thisScope = {module:newScope.module, fnId:newScope.fnId, vars:{}};
-			return execFn(c_lcls, thisScope, c_trace, c_env);
+			return execFn(c_lcls, newScope.fork(), c_trace, c_env);
 		    };
 		}
 	    }
@@ -595,7 +621,7 @@ module.exports = {
 	return function executor(moduleId, fnId, lcls, tracer) {
 	    var env = {resolver:resolver};
 	    var module = resolver.resolve(moduleId);
-	    var ret = stackToJs(rawExecFn(lcls, {module:module, fnId:fnId, vars:{}}, tracer, env, module.functions[fnId]));
+	    var ret = stackToJs(rawExecFn(lcls, new Scope(moduleId, fnId, resolver), tracer, env, module.functions[fnId]));
 	    console.log('execute result: ', ret);
 	    return ret;
 	};
